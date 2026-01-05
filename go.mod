@@ -1,4 +1,4 @@
-module go_hyperliquid
+module github.com/mdn0420/go_hyperliquid
 
 go 1.24.1
 
