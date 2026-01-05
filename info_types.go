@@ -20,6 +20,7 @@ type Asset struct {
 	SzDecimals   int    `json:"szDecimals"`
 	MaxLeverage  int    `json:"maxLeverage"`
 	OnlyIsolated bool   `json:"onlyIsolated"`
+	IsDelisted   bool   `json:"isDelisted"`
 }
 
 type UserState struct {
