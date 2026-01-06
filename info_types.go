@@ -141,15 +141,16 @@ type OrderFill struct {
 }
 
 type Context struct {
-	DayNtlVlm    string   `json:"dayNtlVlm"`
-	Funding      string   `json:"funding"`
+	DayBaseVlm   float64  `json:"dayBaseVlm,string"`
+	DayNtlVlm    float64  `json:"dayNtlVlm,string"`
+	Funding      float64  `json:"funding,string"`
 	ImpactPxs    []string `json:"impactPxs"`
-	MarkPx       string   `json:"markPx"`
-	MidPx        string   `json:"midPx"`
-	OpenInterest string   `json:"openInterest"`
-	OraclePx     string   `json:"oraclePx"`
-	Premium      string   `json:"premium"`
-	PrevDayPx    string   `json:"prevDayPx"`
+	MarkPx       float64  `json:"markPx,string"`
+	MidPx        float64  `json:"midPx,string"`
+	OpenInterest float64  `json:"openInterest,string"`
+	OraclePx     float64  `json:"oraclePx,string"`
+	Premium      float64  `json:"premium,string"`
+	PrevDayPx    float64  `json:"prevDayPx,string"`
 }
 
 type HistoricalFundingRate struct {
