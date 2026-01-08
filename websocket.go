@@ -105,7 +105,7 @@ type WebSocketAPI struct {
 	postResponses    map[int]chan WSPostResponseData
 	mu               sync.RWMutex
 	reconnectCount   int
-	isConnected      bool
+	isConnected      atomic.Bool
 	Debug            bool
 	manualDisconnect bool         // Flag to prevent auto-reconnect on manual disconnect
 	latencyMs        atomic.Int64 // Current latency in milliseconds
@@ -211,13 +211,15 @@ func NewWebSocketAPI(isMainnet bool) *WebSocketAPI {
 
 	client.manualDisconnect = false
 	client.nextPostID.Store(1)
-	client.isConnected = false
+	client.isConnected.Store(false)
 	client.reconnectCount = 0
 	return client
 }
 
 // Connect establishes a WebSocket connection
 func (ws *WebSocketAPI) Connect() error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
 	u, err := url.Parse(ws.url)
 	if err != nil {
 		return fmt.Errorf("failed to parse WebSocket URL: %w", err)
@@ -238,7 +240,7 @@ func (ws *WebSocketAPI) Connect() error {
 	}
 
 	ws.conn = conn
-	ws.isConnected = true
+	ws.isConnected.Store(true)
 	ws.manualDisconnect = false // Reset manual disconnect flag
 	ws.reconnectCount = 0
 	ws.pingStopChan = make(chan struct{}) // Create new stop channel
@@ -249,7 +251,7 @@ func (ws *WebSocketAPI) Connect() error {
 	}
 
 	go ws.readMessages()
-	go ws.pingHandler()
+	go ws.pingHandler(ws.pingStopChan)
 
 	return nil
 }
@@ -259,7 +261,12 @@ func (ws *WebSocketAPI) Disconnect() error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	ws.isConnected = false
+	c := ws.isConnected.CompareAndSwap(true, false)
+	if !c {
+		slog.Info("already disconnected")
+		// already disconnected
+		return nil
+	}
 	ws.manualDisconnect = true // Prevent auto-reconnect
 	ws.reconnectCount = 0      // Reset reconnect count on manual disconnect
 
@@ -297,7 +304,11 @@ func (ws *WebSocketAPI) DisconnectForTesting() error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	ws.isConnected = false
+	c := ws.isConnected.CompareAndSwap(true, false)
+	if !c {
+		// already disconnected
+		return nil
+	}
 	// Don't set manualDisconnect = true, so auto-reconnect will work
 	// Don't reset reconnectCount, so it continues from where it left off
 
@@ -315,7 +326,7 @@ func (ws *WebSocketAPI) DisconnectForTesting() error {
 
 // IsConnected returns the connection status
 func (ws *WebSocketAPI) IsConnected() bool {
-	return ws.isConnected
+	return ws.isConnected.Load()
 }
 
 // SetDebugActive enables debug mode
@@ -326,10 +337,13 @@ func (ws *WebSocketAPI) SetDebug(status bool) {
 // readMessages reads messages from the WebSocket connection with optimized processing
 func (ws *WebSocketAPI) readMessages() {
 	defer func() {
-		ws.isConnected = false
+		ws.Disconnect()
 	}()
 
 	for {
+		if !ws.isConnected.Load() {
+			break
+		}
 		_, message, err := ws.conn.ReadMessage()
 		if err != nil {
 			slog.Error("WebSocket read error", "error", err)
@@ -798,7 +812,7 @@ func getChannelName(subType SubscriptionType) string {
 }
 
 // pingHandler sends periodic ping messages to keep the connection alive
-func (ws *WebSocketAPI) pingHandler() {
+func (ws *WebSocketAPI) pingHandler(stopC chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -811,12 +825,8 @@ func (ws *WebSocketAPI) pingHandler() {
 					if lastPingTime, ok := lastPingTimeValue.(time.Time); ok && !lastPingTime.IsZero() {
 						// If no pong received within 10 seconds, trigger reconnection
 						if time.Since(lastPingTime) > 10*time.Second {
-							if ws.Debug {
-								log.Printf("Pong timeout detected, triggering reconnection")
-							}
-							if !ws.manualDisconnect {
-								go ws.reconnect()
-							}
+							slog.Info("Pong timeout reached, disconnecting")
+							ws.Disconnect()
 							return
 						}
 					}
@@ -827,21 +837,15 @@ func (ws *WebSocketAPI) pingHandler() {
 				if lastMessageTime := ws.lastMessageTime.Load(); lastMessageTime != nil {
 					if lmt, ok := lastMessageTime.(time.Time); ok && time.Since(lmt) > 30*time.Second {
 						if err := ws.doPing(); err != nil {
-							if !ws.manualDisconnect {
-								slog.Info("Ping failed, triggering reconnection")
-								go ws.reconnect()
-							}
+							ws.Disconnect()
+							slog.Info("Ping failed, disconnecting")
 							return
 						}
 					}
 				}
 
-			} else if !ws.manualDisconnect {
-				slog.Info("Disconnected, triggering reconnection")
-				go ws.reconnect()
-				return
 			}
-		case <-ws.pingStopChan:
+		case <-stopC:
 			if ws.Debug {
 				log.Printf("Ping handler stopped")
 			}
@@ -925,7 +929,7 @@ func (ws *WebSocketAPI) reconnect() {
 		ws.conn.Close()
 		ws.conn = nil
 	}
-	ws.isConnected = false
+	ws.isConnected.Store(false)
 
 	// Stop ping handler
 	if ws.pingStopChan != nil {
