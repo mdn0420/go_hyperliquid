@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -110,6 +111,7 @@ type WebSocketAPI struct {
 	latencyMs        atomic.Int64 // Current latency in milliseconds
 	lastPingTime     atomic.Value // Timestamp of the last ping sent (time.Time)
 	nextPostID       atomic.Int64 // Next post request ID
+	lastMessageTime  atomic.Value // Timestamp of the last message received (time.Time)
 
 	// Pre-marshaled messages for efficiency
 	pingMessageBytes []byte
@@ -330,9 +332,7 @@ func (ws *WebSocketAPI) readMessages() {
 	for {
 		_, message, err := ws.conn.ReadMessage()
 		if err != nil {
-			if ws.Debug {
-				log.Printf("WebSocket read error: %v", err)
-			}
+			slog.Error("WebSocket read error", "error", err)
 			// Let ping handler handle reconnection
 			return
 		}
@@ -340,6 +340,8 @@ func (ws *WebSocketAPI) readMessages() {
 		if ws.Debug {
 			log.Printf("Received WebSocket message: %v", message)
 		}
+
+		ws.lastMessageTime.Store(time.Now().UnixMilli())
 
 		// Process all messages as JSON
 		ws.processJSONMessage(message)
@@ -356,9 +358,7 @@ func (ws *WebSocketAPI) processJSONMessage(message []byte) {
 	*response = WSRawResponse{}
 
 	if err := PooledUnmarshal(message, response); err != nil {
-		if ws.Debug {
-			log.Printf("Failed to unmarshal WebSocket message: %v", err)
-		}
+		slog.Error("Failed to unmarshal WebSocket message", "error", err)
 		return
 	}
 
@@ -799,7 +799,7 @@ func getChannelName(subType SubscriptionType) string {
 
 // pingHandler sends periodic ping messages to keep the connection alive
 func (ws *WebSocketAPI) pingHandler() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -809,8 +809,8 @@ func (ws *WebSocketAPI) pingHandler() {
 				// Check for pong timeout before sending new ping
 				if lastPingTimeValue := ws.lastPingTime.Load(); lastPingTimeValue != nil {
 					if lastPingTime, ok := lastPingTimeValue.(time.Time); ok && !lastPingTime.IsZero() {
-						// If no pong received within 45 seconds, trigger reconnection
-						if time.Since(lastPingTime) > 45*time.Second {
+						// If no pong received within 10 seconds, trigger reconnection
+						if time.Since(lastPingTime) > 10*time.Second {
 							if ws.Debug {
 								log.Printf("Pong timeout detected, triggering reconnection")
 							}
@@ -820,31 +820,26 @@ func (ws *WebSocketAPI) pingHandler() {
 							return
 						}
 					}
+					continue
 				}
 
-				// Use pre-marshaled ping message for efficiency
-				ws.mu.Lock()
-				err := ws.conn.WriteMessage(websocket.TextMessage, ws.pingMessageBytes)
-				ws.mu.Unlock()
-
-				if err != nil {
-					if ws.Debug {
-						log.Printf("Ping failed: %v", err)
+				// Send ping if we haven't received a message in awhile
+				if lastMessageTime := ws.lastMessageTime.Load(); lastMessageTime != nil {
+					if lmt, ok := lastMessageTime.(time.Time); ok && time.Since(lmt) > 30*time.Second {
+						if err := ws.doPing(); err != nil {
+							if !ws.manualDisconnect {
+								slog.Info("Ping failed, triggering reconnection")
+								go ws.reconnect()
+							}
+							return
+						}
 					}
-					// Trigger reconnection on ping failure
-					if !ws.manualDisconnect {
-						log.Printf("Ping failed, triggering reconnection")
-						go ws.reconnect()
-					}
-					return
 				}
 
-				// Record the timestamp when ping was sent
-				ws.lastPingTime.Store(time.Now())
-
-				if ws.Debug {
-					log.Printf("Ping sent successfully")
-				}
+			} else if !ws.manualDisconnect {
+				slog.Info("Disconnected, triggering reconnection")
+				go ws.reconnect()
+				return
 			}
 		case <-ws.pingStopChan:
 			if ws.Debug {
@@ -855,9 +850,33 @@ func (ws *WebSocketAPI) pingHandler() {
 	}
 }
 
+func (ws *WebSocketAPI) doPing() error {
+	// Use pre-marshaled ping message for efficiency
+	ws.mu.Lock()
+	err := ws.conn.WriteMessage(websocket.TextMessage, ws.pingMessageBytes)
+	ws.mu.Unlock()
+
+	if err != nil {
+		if ws.Debug {
+			log.Printf("Ping failed: %v", err)
+		}
+		return err
+	}
+
+	// Record the timestamp when ping was sent
+	ws.lastPingTime.Store(time.Now())
+
+	if ws.Debug {
+		log.Printf("Ping sent successfully")
+	}
+
+	return nil
+}
+
 // reconnect attempts to reconnect to the WebSocket server
 func (ws *WebSocketAPI) reconnect() {
 	ws.reconnectCount++
+	slog.Info("Reconnecting websocket", "attempt", ws.reconnectCount)
 
 	var backoff time.Duration
 	switch ws.reconnectCount {
