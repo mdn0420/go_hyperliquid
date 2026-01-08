@@ -1,6 +1,7 @@
 package hyperliquid
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
@@ -127,6 +128,11 @@ type WSSubscription struct {
 	Params interface{} `json:"params"`
 }
 
+type WSRawResponse struct {
+	Channel string
+	Data    json.RawMessage
+}
+
 // WSResponse represents a WebSocket response
 type WSResponse struct {
 	Channel string      `json:"channel"`
@@ -196,7 +202,7 @@ func NewWebSocketAPI(isMainnet bool) *WebSocketAPI {
 		},
 		responsePool: sync.Pool{
 			New: func() interface{} {
-				return &WSResponse{}
+				return &WSRawResponse{}
 			},
 		},
 	}
@@ -343,11 +349,11 @@ func (ws *WebSocketAPI) readMessages() {
 // processJSONMessage efficiently processes JSON messages
 func (ws *WebSocketAPI) processJSONMessage(message []byte) {
 	// Get response object from pool
-	response := ws.responsePool.Get().(*WSResponse)
+	response := ws.responsePool.Get().(*WSRawResponse)
 	defer ws.responsePool.Put(response)
 
 	// Reset response object
-	*response = WSResponse{}
+	*response = WSRawResponse{}
 
 	if err := PooledUnmarshal(message, response); err != nil {
 		if ws.Debug {
@@ -379,8 +385,34 @@ func (ws *WebSocketAPI) processJSONMessage(message []byte) {
 		return
 	}
 
+	processed := WSResponse{
+		Channel: response.Channel,
+		Data:    ws.processMessageData(response),
+	}
+
 	// Process subscription messages with optimized matching
-	ws.processSubscriptionMessage(response)
+	ws.processSubscriptionMessage(&processed)
+}
+
+func (ws *WebSocketAPI) processMessageData(response *WSRawResponse) any {
+	var (
+		res any
+		err error
+	)
+	switch response.Channel {
+	case "activeAssetCtx":
+		d := WSActiveContextData{}
+		err = PooledUnmarshal(response.Data, &d)
+		res = d
+	default:
+		err = PooledUnmarshal(response.Data, res)
+	}
+	if err != nil {
+		if ws.Debug {
+			log.Printf("Failed to unmarshal WebSocket payload: %v", err)
+		}
+	}
+	return res
 }
 
 // handlePong processes pong messages and updates latency
@@ -534,12 +566,8 @@ func (ws *WebSocketAPI) matchL2Book(sub *Subscription, response *WSResponse) boo
 }
 
 func (ws *WebSocketAPI) matchActiveAssetCtx(sub *Subscription, response *WSResponse) bool {
-	if dataMap, ok := response.Data.(map[string]interface{}); ok {
-		if coin, exists := dataMap["coin"]; exists {
-			if coinStr, ok := coin.(string); ok {
-				return coinStr == sub.Coin
-			}
-		}
+	if data, ok := response.Data.(WSActiveContextData); ok {
+		return data.Coin == sub.Coin
 	}
 	return false
 }
